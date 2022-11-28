@@ -89,3 +89,9 @@ def load_blender_data(basedir, half_res=False, testskip=1):
     return imgs, poses, render_poses, [H, W, focal], i_split
 
 
+if __name__ == "__main__":
+    root_dir = '/home/baihy/datasets/nerf_synthetic/nerf_synthetic/lego'
+    imgs, poses, render_poses, hwf, i_spilt = load_blender_data(root_dir)
+    print(imgs.shape, poses.shape, render_poses.shape)
+
+

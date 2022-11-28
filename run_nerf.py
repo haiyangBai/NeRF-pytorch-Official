@@ -55,7 +55,8 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
-    for i in range(0, rays_flat.shape[0], chunk):
+    # print(**kwargs)
+    for i in range(0, rays_flat.shape[0], int(chunk)):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
@@ -275,7 +276,8 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
     dists = z_vals[...,1:] - z_vals[...,:-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+    inf_d = torch.Tensor([1e10]).expand(dists[...,:1].shape).to(dists.device)
+    dists = torch.cat([dists, inf_d], -1)  # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
@@ -292,7 +294,8 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
 
     alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    weight = torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)).to(alpha.device), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    weights = alpha * weight
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
     depth_map = torch.sum(weights * z_vals, -1)
@@ -354,7 +357,7 @@ def render_rays(ray_batch,
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
-    t_vals = torch.linspace(0., 1., steps=N_samples)
+    t_vals = torch.linspace(0., 1., steps=N_samples, device=near.device)
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
     else:
@@ -368,13 +371,13 @@ def render_rays(ray_batch,
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
         lower = torch.cat([z_vals[...,:1], mids], -1)
         # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape)
+        t_rand = torch.rand(z_vals.shape, device=z_vals.device)
 
         # Pytest, overwrite u with numpy's fixed random numbers
         if pytest:
             np.random.seed(0)
             t_rand = np.random.rand(*list(z_vals.shape))
-            t_rand = torch.Tensor(t_rand)
+            t_rand = torch.Tensor(t_rand, device=z_vals.device)
 
         z_vals = lower + (upper - lower) * t_rand
 
@@ -523,9 +526,9 @@ def config_parser():
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000, 
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_testset", type=int, default=50000, 
+    parser.add_argument("--i_testset", type=int, default=20000, 
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=50000, 
+    parser.add_argument("--i_video",   type=int, default=20000, 
                         help='frequency of render_poses video saving')
 
     return parser
@@ -613,7 +616,7 @@ def train():
     hwf = [H, W, focal]
 
     if K is None:
-        K = np.array([
+        K = torch.Tensor([
             [focal, 0, 0.5*W],
             [0, focal, 0.5*H],
             [0, 0, 1]
@@ -708,6 +711,8 @@ def train():
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
     start = start + 1
+    all_losses = []
+    all_psnrs = []
     for i in trange(start, N_iters):
         time0 = time.time()
 
@@ -733,7 +738,7 @@ def train():
             pose = poses[img_i, :3,:4]
 
             if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+                rays_o, rays_d = get_rays(H, W, K, pose)  # (H, W, 3), (H, W, 3)
 
                 if i < args.precrop_iters:
                     dH = int(H//2 * args.precrop_frac)
@@ -753,7 +758,7 @@ def train():
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                batch_rays = torch.stack([rays_o, rays_d], 0)
+                batch_rays = torch.stack([rays_o, rays_d], 0)   # (N_rand, 6)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
@@ -766,6 +771,9 @@ def train():
         trans = extras['raw'][...,-1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
+        
+        all_losses.append(loss)
+        all_psnrs.append(psnr)
 
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
@@ -784,9 +792,12 @@ def train():
             param_group['lr'] = new_lrate
         ################################
 
-        dt = time.time()-time0
-        # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
-        #####           end            #####
+        if (i + 1) % args.i_print == 0:       # i_print: 100
+            mean_loss = (sum(all_losses) / len(all_losses)).item()
+            mean_psnr = (sum(all_psnrs) / len(all_psnrs)).item()
+            tqdm.write(f"[TRAIN] [{expname}] Iter: {i+1} Loss: {mean_loss}  PSNR: {mean_psnr}")
+            all_losses = []
+            all_psnrs = []
 
         # Rest is logging
         if i%args.i_weights==0:
@@ -815,64 +826,52 @@ def train():
             #     render_kwargs_test['c2w_staticcam'] = None
             #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
-        if i%args.i_testset==0 and i > 0:
-            testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
-            os.makedirs(testsavedir, exist_ok=True)
-            print('test poses shape', poses[i_test].shape)
-            with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
-            print('Saved test set')
-
-
-    
-        if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
-
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
-
-
-            if i%args.i_img==0:
-
-                # Log a rendered validation view to Tensorboard
-                img_i=np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3,:4]
-                with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                        **render_kwargs_test)
-
-                psnr = mse2psnr(img2mse(rgb, target))
-
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                    tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
-
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
-
-
-                if args.N_importance > 0:
-
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
+        # if i%args.i_testset==0 and i > 0:
+        #     testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
+        #     os.makedirs(testsavedir, exist_ok=True)
+        #     print('test poses shape', poses[i_test].shape)
+        #     with torch.no_grad():
+        #         render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+        #     print('Saved test set')
 
         global_step += 1
 
 
 if __name__=='__main__':
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
     train()
+    # basedir = './logs'
+    # expname = 'lego'
+
+    # config = os.path.join('./configs', 'lego.txt')
+
+    # parser = config_parser()
+    # args = parser.parse_args()
+    # ft_str = '' 
+    # ft_str = 'f--ft_path {None}'    # .format(os.path.join(basedir, expname, '020000.tar'))
+    # args = parser.parse_args('--config {} '.format(config)) #  + ft_str)
+
+    # # Create nerf model
+    # _, render_kwargs_test, start, grad_vars, models = create_nerf(args)
+
+    # bds_dict = {
+    #     'near': 2.,
+    #     'far': 6.,
+    # }
+    # render_kwargs_test.update(bds_dict)
+
+    # net_fn = render_kwargs_test['network_query_fn']
+    # print(net_fn)
+
+    # # Render an overhead view to check model was loaded correctly
+    # c2w = torch.Tensor(np.eye(4)[:3,:4].astype(np.float32)) # identity pose matrix
+    # c2w[2,-1] = 4.
+    # H, W, focal = 800, 800, 1200.
+    # down = 8
+    # K = np.array([
+    #             [focal/down, 0, 0.5*W//down],
+    #             [0, focal/down, 0.5*H//down],
+    #             [0, 0, 1]
+    #         ])
+    # test = render(H//down, W//down, K, focal/down, c2w=c2w, **render_kwargs_test)
